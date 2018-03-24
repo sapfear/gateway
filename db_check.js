@@ -1,7 +1,7 @@
 const MongoClient    = require('mongodb').MongoClient;
 
 var url = "mongodb://localhost:27017/test_2";
-var req_count = 13;
+var req_count = 14;
 
 MongoClient.connect(url, function(err, db) {
 	var rf_1 = { tagID: '__1209' + new Date().getTime(), status: 'Requested' };
@@ -17,7 +17,7 @@ MongoClient.connect(url, function(err, db) {
 			db.close();
 	}
 	//db.collection("rfid_reqs").insertOne(rf_1, callback);
-	db.collection("tag_requests").findOne({}, function(err, old_state) {
+	db.collection("tag_requests").find({}).toArray(function(err, old_state) {
 		console.log("=======================");
 		console.log("tag_requests");
 		console.log(old_state);
@@ -92,6 +92,12 @@ MongoClient.connect(url, function(err, db) {
 	if(1) db.collection("start_requests").find({}).limit(5).toArray( function(err, old_state) {
 		console.log("=======================");
 		console.log("start_requests");
+		console.log(old_state);
+		check_close();
+	});
+	if(1) db.collection("configuration_info").find({}).limit(1).toArray( function(err, old_state) {
+		console.log("=======================");
+		console.log("configuration_info");
 		console.log(old_state);
 		check_close();
 	});

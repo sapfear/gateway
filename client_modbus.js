@@ -2,21 +2,29 @@ var xml2js = require('xml2js');
 var modbus = require('jsmodbus');
 
 const UDP_LISTENING_PORT = 7751;
-const REGISTER_READ_OFFSET = 0;
+const REGISTER_READ_OFFSET = 200;
 const REGISTER_WRITE_OFFSET = 0;
-const REREAD_TIMEOUT = 1000 * 20; //10 secs
+const REREAD_TIMEOUT = 1000 * 20; //20 secs
 const MongoClient    = require('mongodb').MongoClient;
+const MAIN_LOOP_TIMEOUT = 500;
+const UNLOCK_TIMEOUT = 1000;
 var dgram = require('dgram');
 var client = dgram.createSocket('udp4');
 
 var main_modbus_addr = '';
 var main_modbus_port = 0;
 var modbus_slave_id = 0;
-var main_loop, modbus_up;
+var main_loop, modbus_up, mosbus_init;
+//var debug = true, debug_addr = '192.168.0.104';
 var debug = true, debug_addr = '192.168.7.2';
+//var debug = true, debug_addr = '192.168.2.92';
 var modbus_client, modbus_client_online_status = false;
 var mongo_url = "mongodb://localhost:27017/test_2";
 var mongo_db_instance = null, mongo_client_online_status = false;
+
+var register_map_read = {}, register_map_write = {};
+
+const isLittleEndian = true;
 
 var mongoConnect = function(delay){
 	setTimeout(function(){
@@ -37,10 +45,53 @@ var mongoConnect = function(delay){
 		
 	}, delay)
 }
-mongoConnect(1000);
+
+var read_configs = function(){
+	var lines = require('fs').readFileSync(__dirname + '/config/regs_4.csv', 'utf-8')
+		.split('\n')
+		.filter(Boolean);
+		
+	if(lines.length === 1)
+		lines = require('fs').readFileSync(__dirname + '/config/regs_4.csv', 'utf-8')
+		.split('\r')
+		.filter(Boolean);
+	
+	for(i = 0; i < lines.length; i++){
+		var splitted_line = lines[i].split(';');
+		if(!!splitted_line && !!splitted_line[0] && !!splitted_line[2] && !!splitted_line[3] && !!splitted_line[4] && ['IN', 'OUT'].indexOf(splitted_line[3]) != -1){
+			if(splitted_line[3] == 'OUT')
+				register_map_read[splitted_line[0]] = {
+					startAddress: +splitted_line[4],
+					length: +splitted_line[2]
+				};
+			else
+				register_map_write[splitted_line[0]] = {
+					startAddress: +splitted_line[4],
+					length: +splitted_line[2]
+				};
+		}
+	}
+	
+	mongoConnect(1000);
+}
+
+read_configs();
 
 var getRegistrValueStr = function(buffer, number, length){
-	return buffer.slice(number*2, number*2 + length).toString().replace(/\0/g, '');
+	const buffer_str = buffer.slice(number*2, number*2 + length);
+
+	if(!!isLittleEndian ) buffer_str.swap16();
+	
+	return buffer_str.toString().replace(/\0/g, '');
+};
+
+var getRegistrValueUIntX = function(buffer, number, length){
+	const buffer_int = buffer.slice(number*2, number*2 + length * 2)
+
+	if(!!isLittleEndian) buffer_int.swap16();
+	if(!!isLittleEndian && length == 8) buffer_int.swap32().swap64();
+	
+	return buffer_int.readUIntLE(0, length * 2);
 };
 
 var getRegistrValueUInt16 = function(buffer, number){
@@ -54,6 +105,33 @@ var getRegistrValueUInt32 = function(buffer, number){
 var getRegistrValueUInt64 = function(buffer, number){
 	return buffer.readUIntBE(number*2, 8);
 };
+
+var getRegValue = function(buffer, name, offset){
+	var reg_obj = register_map_read[name];
+	if(!reg_obj)
+		return null;
+	
+	switch(reg_obj.length){
+		case 1:
+		case 2:
+		case 4:
+			return getRegistrValueUIntX(buffer, reg_obj.startAddress - offset, reg_obj.length);
+		break;
+		default:
+			return getRegistrValueStr(buffer, reg_obj.startAddress - offset, reg_obj.length*2);
+		break;
+	}
+}
+
+var getBufferFromUIntX = function(number, len){
+	var buf = new Buffer.alloc(2*len);
+	buf.writeIntLE(number, 0, 2*len);
+
+	if(!!isLittleEndian && len == 8 ) buf.swap64().swap32();
+	if(!!isLittleEndian ) buf.swap16();
+	
+	return buf;
+}
 
 var getBufferFromUInt16 = function(number){
 	var buf = new Buffer.alloc(2);
@@ -76,14 +154,59 @@ var getBufferFromUInt64 = function(number){
 var getBufferFromStr = function(str, length){
 	var buf = new Buffer.alloc(length);
 	buf.write(str, 0, 'ascii');
+	if(!!isLittleEndian ) buf.swap16();
 	return buf;
 };
+
+var getBufferFromDatetime = function(value, length){
+    var date = new Date(value);
+    var buf = new Buffer([
+        date.getMinutes(),
+        date.getSeconds(),
+        0,
+        date.getHours(),
+        date.getMonth() + 1,
+        date.getDate(),
+        (date.getFullYear() >>> 8) & 0xFF,
+        date.getFullYear() & 0xFF
+    ]);
+    return buf;
+}
+
+var writeRegister = function(name, value){
+	var reg_obj = register_map_write[name];
+	if(!reg_obj)
+		return null;
+	var buf;
+	
+	if(name.indexOf('_DATETIME') != -1){
+		//console.log(name);
+		//console.log(new Date(value));
+		//console.log(getBufferFromDatetime(value, reg_obj.length));
+		buf = getBufferFromDatetime(value, reg_obj.length);
+	} else {
+		switch(reg_obj.length){
+			case 1:
+			case 2:
+			case 4:
+				buf = getBufferFromUIntX(value, reg_obj.length);
+			break;
+			default:
+				buf = getBufferFromStr(value, reg_obj.length*2);
+			break;
+		}
+	}
+	
+	modbus_client.writeMultipleRegisters(reg_obj.startAddress + REGISTER_WRITE_OFFSET, buf).then(function (resp) {
+
+    }, console.error);
+}
 
 var writeMultiplyRegisters = function(data, registr_start){
 	modbus_client.writeMultipleRegisters(REGISTER_WRITE_OFFSET + registr_start, Buffer.concat(data)).then(function (resp) {
         
         // resp will look like { fc : 16, startAddress: 4, quantity: 4 }
-        console.log(resp);
+        //console.log(resp);
         
     }, console.error);
 }
@@ -145,7 +268,9 @@ modbus_up = function(host, port, callback){
 		modbus_client_online_status = false;
 	});
 	
-	main_loop(1000);
+	mosbus_init(1000);
+	
+	main_loop(MAIN_LOOP_TIMEOUT);
 }
 
 client.on('listening', function () {
@@ -185,7 +310,7 @@ client.on('message', function (message, remote) {
 					console.log( 'SLAVE: ' + modbus_slave_id );
 					
 					modbus_up(main_modbus_addr, main_modbus_port, function(){
-						main_loop(2000);
+						main_loop(MAIN_LOOP_TIMEOUT);
 					});
 					//process.exit()
 				}
@@ -195,442 +320,561 @@ client.on('message', function (message, remote) {
 	
 });
 
+mosbus_init = function(delay){
+	if(modbus_client_online_status == true){
+
+		writeRegister('CONTROL_CON1_LOCK_ALLOW', 1);
+		writeRegister('CONTROL_CON1_AUTH_ALLOW', 1);
+		writeRegister('CONTROL_CON1_CHARGING_ALLOW', 1);
+		
+		writeRegister('CONTROL_CON2_LOCK_ALLOW', 1);
+		writeRegister('CONTROL_CON2_AUTH_ALLOW', 1);
+		writeRegister('CONTROL_CON2_CHARGING_ALLOW', 1);
+		
+		writeRegister('RESERV_CON1_CMD', 0);
+		writeRegister('RESERV_CON2_CMD', 0);
+		
+	} else {
+		setTimeout(function(){
+			mosbus_init(delay);
+		}, delay);
+	}
+}
+
+var print_idle = (function(){
+	var a = 0;
+	var progress_letters = ["/", "—", "\\", "|"];
+	return function(text){
+		a++;
+		process.stdout.write('  ' + text + ' ' + progress_letters[a%progress_letters.length] + '\033[0G');
+	}
+})()
+
 main_loop = function(delay){
-	//console.log('IDLE: modbus_client_online_status: ' + modbus_client_online_status);
-	//console.log('IDLE: mongo_client_online_status: ' + mongo_client_online_status);
+	print_idle('IDLE: modbus_client_online_status: ' + modbus_client_online_status + ', mongo_client_online_status: ' + mongo_client_online_status);
 	
 	//writeMultiplyRegisters([getBufferFromUInt32(555)], 71);
 	
 	
 	var read_modbus_function_name = (false) ? 'readHoldingRegisters' : 'readInputRegisters'; //(!!debug) ? 'readHoldingRegisters' : 'readInputRegisters';
-	
-	if(modbus_client_online_status == true && mongo_client_online_status == true) modbus_client[read_modbus_function_name](REGISTER_READ_OFFSET + 0, 11).then(function (resp) {
-		
-		var current_time = new Date().getTime();
-		// resp will look like { fc: 4, byteCount: 20, register: [ values 0 - 10 ], payload: <Buffer> }
-		//console.log(resp);
-		console.log(resp.payload);
-		console.log(getRegistrValueStr(resp.payload, 0, 20));
-	    console.log('AUTH_CMD: ' + !!getRegistrValueUInt16(resp.payload, 10));
-		return;
 
-		var result_object = {
-	    	AUTH_IDTAG: getRegistrValueStr(resp.payload, 0, 20),
-	    	AUTH_CMD: !!getRegistrValueUInt16(resp.payload, 10),
-	    	
-	    	BN_PLC_RUNNING: !!getRegistrValueUInt16(resp.payload, 13),
-	    	BN_PLC_SW_VERSION: getRegistrValueStr(resp.payload, 14, 16),
-	    	BN_EVCHST_MODEL: getRegistrValueStr(resp.payload, 22, 16),
-			BN_CS_DATETIME: 0,
-			BN_EVCHST_ACCEPTED: -1,
-	    	
-	    	MV_CONNECTOR1_WHMETER: getRegistrValueUInt32(resp.payload, 39),
-	    	MV_CONNECTOR2_WHMETER: getRegistrValueUInt32(resp.payload, 41),
-	    	MV_CONNECTOR1_ACTPOW: getRegistrValueUInt32(resp.payload, 43),
-	    	MV_CONNECTOR2_ACTPOW: getRegistrValueUInt32(resp.payload, 45),
-	    	MV_CONNECTOR1_VOLTAGE: getRegistrValueUInt32(resp.payload, 47),
-	    	MV_CONNECTOR2_VOLTAGE: getRegistrValueUInt32(resp.payload, 49),
-	    	MV_CONNECTOR1_CURRENT: getRegistrValueUInt32(resp.payload, 51),
-	    	MV_CONNECTOR2_CURRENT: getRegistrValueUInt32(resp.payload, 53),
-	    	
-	    	START_CONNECTOR_ID: getRegistrValueUInt16(resp.payload, 55),
-	    	START_WHMETER: getRegistrValueUInt32(resp.payload, 56),
-	    	START_IDTAG: getRegistrValueStr(resp.payload, 58, 20),
-	    	START_CMD: !!getRegistrValueUInt16(resp.payload, 68),
-			START_ACCEPTED: -1,
-			START_TRANSACTION_ID: -1,
-	    	
-	    	SN_CON1_FAULTCODE: getRegistrValueUInt16(resp.payload, 73),
-	    	SN_CON2_FAULTCODE: getRegistrValueUInt16(resp.payload, 74),
-	    	SN_CON1_STATUS: getRegistrValueUInt16(resp.payload, 75),
-	    	SN_CON2_STATUS: getRegistrValueUInt16(resp.payload, 76),
-	    	SN_CON1_CMD: !!getRegistrValueUInt16(resp.payload, 77),
-	    	SN_CON2_CMD: !!getRegistrValueUInt16(resp.payload, 78),
-	    	SN_CON1_COMPLETE: -1,
-	    	SN_CON2_COMPLETE: -1,
-	    	
-	    	STOP_CONNECTOR_ID: getRegistrValueUInt16(resp.payload, 81),
-	    	STOP_WHMETER: getRegistrValueUInt32(resp.payload, 82),
-	    	STOP_IDTAG: getRegistrValueStr(resp.payload, 84, 20),
-	    	STOP_TRANSACTION_ID: getRegistrValueUInt32(resp.payload, 94),
-	    	STOP_CMD: !!getRegistrValueUInt16(resp.payload, 96),
-			STOP_COMPLETE: -1
-	    }
-	    
-	    var result_write = {};
-	    
-	    //console.log(result_object);
-	    
-	    
-		var throw_callback = function(err, result) {
-			if(!!err){
-				//mongo_db_instance.close();
-				//mongoConnect(1000);
-				mongo_client_online_status = false;
-				return true;
-			}
-			return false
-			//if (err) throw err;
-		}
-		//TAG AUTH
-		mongo_db_instance.collection("tag_requests").findOne({}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-				
-			var auth_result_write = [];
+	
+	if(modbus_client_online_status == true && mongo_client_online_status == true) modbus_client[read_modbus_function_name](REGISTER_READ_OFFSET + 0, 100).then(function (first_resp) {
+		modbus_client[read_modbus_function_name](REGISTER_READ_OFFSET + 100, 35).then(function (resp) {
 			
-			if(result_object.AUTH_CMD == true){
-				
-				if(!!old_state && !!old_state.AUTH_COMPLETE && result_object.AUTH_IDTAG == old_state.AUTH_IDTAG && old_state.STATUS == 'ReceivedFromOCPP' && old_state.TIME+REREAD_TIMEOUT >= current_time){
-					//need write answer to modbus
-					auth_result_write = [getBufferFromUInt16(old_state.AUTH_COMPLETE), getBufferFromUInt16(old_state.AUTH_IDTAG_ACCEPTED)];
-					
-					console.log(auth_result_write);
-				} else {
-					if(!!old_state && (old_state.STATUS == "ReceivedFromModbus" || old_state.STATUS == "TransmittedToOCPP" ) ){
-						console.log('not need write to DB');
-					} else {
-						//need write request to DB again
-						console.log('need write to DB again');
-						var new_state = {
-							AUTH_IDTAG: result_object.AUTH_IDTAG,
-							STATUS: 'ReceivedFromModbus',
-							TIME: current_time
-						}
-						
-						if(old_state != null && !!old_state._id){
-							mongo_db_instance.collection("tag_requests").updateOne({_id: old_state._id}, new_state, throw_callback);
-						} else {
-							mongo_db_instance.collection("tag_requests").insertOne(new_state, throw_callback);
-						}
-					}
-				}
-			} else {
-				console.log('AUTH_CMD == false');
-				auth_result_write = [getBufferFromUInt16(0), getBufferFromUInt16(0)];
-			}
-			writeMultiplyRegisters(auth_result_write, 11);
-		});
-		
-		//BOOT NOTIFICATION
-		mongo_db_instance.collection("boot_notification_state").findOne({}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			var new_state = {}
-			if (!!result_object.BN_PLC_RUNNING){
-				new_state = {
-					BN_PLC_RUNNING: result_object.BN_PLC_RUNNING,
-			    	BN_PLC_SW_VERSION: result_object.BN_PLC_SW_VERSION,
-			    	BN_EVCHST_MODEL: result_object.BN_EVCHST_MODEL
-				}
-			} else {
-				new_state = {
-					BN_PLC_RUNNING: result_object.BN_PLC_RUNNING,
-			    	BN_PLC_SW_VERSION: '',
-			    	BN_EVCHST_MODEL: '',
-			    	BN_CS_DATETIME: '',
-			    	BN_EVCHST_ACCEPTED: '' 
-				}
-			}
+			resp.byteCount += first_resp.byteCount;
+			resp.payload = Buffer.concat([first_resp.payload, resp.payload]);
+			resp.register += first_resp.register;
 			
-			var boot_result_write = [getBufferFromUInt64(!!old_state ? old_state.BN_CS_DATETIME : 0), getBufferFromUInt16(!!old_state ? old_state.BN_EVCHST_ACCEPTED : 0)];
-						
-			if(old_state != null && !!old_state._id){
-				mongo_db_instance.collection("boot_notification_state").updateOne({_id: old_state._id}, { $set: new_state }, throw_callback);
-			} else {
-				mongo_db_instance.collection("boot_notification_state").insertOne(new_state, throw_callback);
-			}
-			writeMultiplyRegisters(boot_result_write, 30);
-			//console.log(result_write);
-		});
+			var current_time = new Date().getTime();
+			// resp will look like { fc: 4, byteCount: 20, register: [ values 0 - 10 ], payload: <Buffer> }
+			//console.log(resp);
+			//console.log(getRegValue(resp.payload, 'START_CON2_IDTAG', REGISTER_READ_OFFSET));
 		
-		//METER VALUES
-		mongo_db_instance.collection("meter_values").findOne({}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			var new_state = {
-				MV_CONNECTOR1_WHMETER: result_object.MV_CONNECTOR1_WHMETER,
-		    	MV_CONNECTOR2_WHMETER: result_object.MV_CONNECTOR2_WHMETER,
-		    	MV_CONNECTOR1_ACTPOW: result_object.MV_CONNECTOR1_ACTPOW,
-		    	MV_CONNECTOR2_ACTPOW: result_object.MV_CONNECTOR2_ACTPOW,
-		    	MV_CONNECTOR1_VOLTAGE: result_object.MV_CONNECTOR1_VOLTAGE,
-		    	MV_CONNECTOR2_VOLTAGE: result_object.MV_CONNECTOR2_VOLTAGE,
-		    	MV_CONNECTOR1_CURRENT: result_object.MV_CONNECTOR1_CURRENT,
-		    	MV_CONNECTOR2_CURRENT: result_object.MV_CONNECTOR2_CURRENT,
-			}
-						
-			if(old_state != null && !!old_state._id){
-				mongo_db_instance.collection("meter_values").updateOne({_id: old_state._id}, new_state, throw_callback);
-			} else {
-				mongo_db_instance.collection("meter_values").insertOne(new_state, throw_callback);
-			}
-		});
+		    //console.log('START_CON2_CMD: ' + getRegValue(resp.payload, 'START_CON2_CMD', REGISTER_READ_OFFSET));
+			//return;
 		
-		//START TRANSACTION
-		mongo_db_instance.collection("start_transaction").findOne({}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			var start_transaction_result_write = [];
-			if(result_object.START_CMD == true){
-				console.log('START_CMD == true');
-				if(!!old_state && !!old_state.START_COMPLETE && result_object.START_IDTAG == old_state.START_IDTAG && old_state.STATUS == 'ReceivedFromOCPP' && old_state.TIME+REREAD_TIMEOUT >= current_time){
-					//need write answer to modbus
-					start_transaction_result_write = [
-						getBufferFromUInt16(1),
-						getBufferFromUInt16(old_state.START_ACCEPTED),
-						getBufferFromUInt32(old_state.START_TRANSACTION_ID)
-					]
-				} else {
-					if(!!old_state && old_state.STATUS == "ReceivedFromModbus"){
-						console.log('not need write to DB');
-					} else {
-						//need write request to DB again
-						console.log('need write to DB again');
-						var new_state = {
-							START_CONNECTOR_ID: result_object.START_CONNECTOR_ID,
-							START_WHMETER: result_object.START_WHMETER,
-							START_IDTAG: result_object.START_IDTAG,
-							STATUS: 'ReceivedFromModbus',
-							TIME: current_time
-						}
-						
-						if(old_state != null && !!old_state._id){
-							mongo_db_instance.collection("start_transaction").updateOne({_id: old_state._id}, new_state, throw_callback);
-						} else {
-							mongo_db_instance.collection("start_transaction").insertOne(new_state, throw_callback);
-						}
-					}
+			var result_object = {};
+			for(register_name in register_map_read){
+				//console.log(register_name);
+				result_object[register_name] = getRegValue(resp.payload, register_name, REGISTER_READ_OFFSET);
+			}
+		
+		    var result_write = {};
+	    
+		    //console.log(result_object);
+	    
+	    
+			var throw_callback = function(err, result) {
+				if(!!err){
+					mongo_client_online_status = false;
+					return true;
 				}
-			} else {
-				if(old_state != null && !!old_state._id){
-					mongo_db_instance.collection("start_transaction").remove( {_id: old_state._id}, throw_callback)
-				}
-				
-				console.log('START_CMD == false');
-				start_transaction_result_write = [
-					getBufferFromUInt16(0),
-					getBufferFromUInt16(0),
-					getBufferFromUInt32(0)
-				]
+				return false
 			}
-			
-			writeMultiplyRegisters(start_transaction_result_write, 69);
-		});
 		
-		//STATUS NOTIFICATION
-	    if(result_object.SN_CON1_CMD == true){
-	    	console.log('SN_CON1_CMD == 1');
-	    	mongo_db_instance.collection("status_notifications").insertOne({
-	    		CONNECTOR_ID: 1,
-	    		SN_CON_FAULTCODE: getConnectorFaultcode(result_object.SN_CON1_FAULTCODE),
-	    		SN_CON_STATUS: getConnectorStatus(result_object.SN_CON1_FAULTCODE),
-	    		STATUS: 'ReceivedFromModbus'
-	    	}, function(err, insert_result){
-				if (throw_callback(err))
-					return;
-				writeMultiplyRegisters([getBufferFromUInt16(1)], 79);
-	    	});
-	    }
-	    if(result_object.SN_CON2_CMD == true){
-	    	console.log('SN_CON2_CMD == 1');
-	    	mongo_db_instance.collection("status_notifications").insertOne({
-	    		CONNECTOR_ID: 2,
-	    		SN_CON_FAULTCODE: getConnectorFaultcode(result_object.SN_CON2_FAULTCODE),
-	    		SN_CON_STATUS: getConnectorStatus(result_object.SN_CON2_FAULTCODE),
-	    		STATUS: 'ReceivedFromModbus'
-	    	}, function(err, insert_result){
-				if (throw_callback(err))
-					return;
-				writeMultiplyRegisters([getBufferFromUInt16(1)], 80);
-	    	});
-	    }
-		
-	    //STOP TRANSACTION
-		var stop_transaction_result_write = [];
-	    if(result_object.STOP_CMD == true){
-			console.log('STOP_CMD == true');
-			mongo_db_instance.collection("stop_transactions").findOne({STOP_TRANSACTION_ID: result_object.STOP_TRANSACTION_ID}, function(err, old_state) {
-				if (throw_callback(err))
-					return;
-				if(old_state != null && !!old_state._id){
-					//FINDED STOP_TRANSACTION_ID
-					if(old_state.STATUS == 'ReceivedFromOCPP'){
-						stop_transaction_result_write = [getBufferFromUInt16(1)];
-						writeMultiplyRegisters(stop_transaction_result_write, 97);
-					} else {
-						//wait response
-					}
-				} else {
-					var new_state = {
-						STOP_CONNECTOR_ID: result_object.STOP_CONNECTOR_ID,
-						STOP_WHMETER: result_object.STOP_WHMETER,
-						STOP_IDTAG: result_object.STOP_IDTAG,
-						STOP_TRANSACTION_ID: result_object.STOP_TRANSACTION_ID,
-						STATUS: 'ReceivedFromModbus',
-						TIME: current_time
-					}
-					mongo_db_instance.collection("stop_transactions").insertOne(new_state, throw_callback);
-				}
-			});
-		} else {
-			console.log('STOP_CMD == false');
-			stop_transaction_result_write = [getBufferFromUInt16(0)]
-			writeMultiplyRegisters(stop_transaction_result_write, 97);
-		}
-		
-		mongo_db_instance.collection("reserve_state").find(
-			{
-				STATUS: 'ReceivedFromOCPP',
-				$or:[
-					{ CONNECTOR_ID: '1' },
-					{ CONNECTOR_ID: '2' }
-				]
-			}
-		).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			//console.log("reserve_state");
-			//console.log(old_state);
-			if (!!old_state) for(i = 0; i < old_state.length; i++ ){
-				var values = old_state[i];					
-					
-				var reservenow_result_write = [
-					getBufferFromStr(values.RESERV_CON_IDTAG, 20),
-					getBufferFromUInt32(values.RESERV_CON_RESID),
-					getBufferFromUInt64(values.RESERV_CON_DATETIME),
-					getBufferFromUInt16(values.RESERV_CON_CMD)
-				];
-				
-				mongo_db_instance.collection("reserve_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
-					if (throw_callback(err))
-						return;
-					switch(values.CONNECTOR_ID+''){
-						case '1':
-							writeMultiplyRegisters(reservenow_result_write, 98);
-						break;
-						case '2':
-							writeMultiplyRegisters(reservenow_result_write, 115);
-						break;
-					}					
-				});
-				
-			}
-		});
-		mongo_db_instance.collection("availability_state").find(
-			{
-				STATUS: 'ReceivedFromOCPP',
-				$or:[
-					{ CONNECTOR_ID: '1' },
-					{ CONNECTOR_ID: '2' }
-				]
-			}
-		).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			//console.log("availability_state");
-			//console.log(old_state);
-			if (!!old_state) for(i = 0; i < old_state.length; i++ ){
-				var values = old_state[i];
-				mongo_db_instance.collection("availability_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
-					if (throw_callback(err))
-						return;
-					switch(values.CONNECTOR_ID+''){
-						case '1':
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_CHARGE)], 134);
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_CHARGE)], 136);
-						break;
-						case '2':
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_CHARGE)], 135);
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_CHARGE)], 137);
-						break;
-					}					
-				});
-				
-			}
-		});
-		mongo_db_instance.collection("lock_state").find(
-			{
-				STATUS: 'ReceivedFromOCPP',
-				$or:[
-					{ CONNECTOR_ID: '1' },
-					{ CONNECTOR_ID: '2' }
-				]
-			}
-		).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			if (!!old_state) for(i = 0; i < old_state.length; i++ ){
-				var values = old_state[i];
-				mongo_db_instance.collection("lock_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
-					if (throw_callback(err))
-						return;
-					switch(values.CONNECTOR_ID+''){
-						case '1':
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_LOCK)], 132);
-						break;
-						case '2':
-							writeMultiplyRegisters([getBufferFromUInt16(values.CAN_LOCK)], 133);
-						break;
-					}					
-				});
-				
-			}
-		});
-		
-		mongo_db_instance.collection("stop_requests").findOne({
-			STATUS: 'ReceivedFromOCPP'
-		}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			if (!!old_state) {
-				if(!!old_state.TRANSACTION_ID){
-					var stop_result_write = [
-						getBufferFromUInt32(old_state.TRANSACTION_ID)
-					];
-					
-					mongo_db_instance.collection("stop_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+			//TAG AUTH
+			//if(!!result_object.AUTH_CON1_CMD || !!result_object.AUTH_CON2_CMD){
+			var find_auth = function(connector_id){
+				if(!!result_object['AUTH_CON' + connector_id + '_CMD']){
+					console.log('AUTH_CON' + connector_id + '_CMD == true');
+					//console.log(connector_id);
+					mongo_db_instance.collection("tag_requests").find({
+						CONNECTOR_ID: connector_id
+					}).sort({ _id: -1 }).limit(1).toArray(function(err, old_state) {
+						console.log(old_state);
+						
 						if (throw_callback(err))
 							return;
-						writeMultiplyRegisters(stop_result_write, 200);				
-					}); 
-				} else {
-					mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
-				}
-			}
-		});
-		
-		mongo_db_instance.collection("start_requests").findOne({
-			STATUS: 'ReceivedFromOCPP'
-		}, function(err, old_state) {
-			if (throw_callback(err))
-				return;
-			//console.log("reserve_state");
-			//console.log(old_state);
-			if (!!old_state) {
-				if(!!old_state.TAG_ID && !!old_state.CONNECTOR_ID){
-					var start_result_write = [
-						getBufferFromStr(old_state.TAG_ID, 20),
-						getBufferFromUInt32(old_state.CONNECTOR_ID)
-					];
+						if(!!old_state)
+							old_state = old_state[0];
 					
-					mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
-						if (throw_callback(err))
-							return;
-						switch(old_state.CONNECTOR_ID+''){
-							case '1':
-								writeMultiplyRegisters(start_result_write, 202);
-							break;
-							case '2':
-								writeMultiplyRegisters(start_result_write, 202);
-							break;
-						}					
+						if(!!old_state && !!old_state.AUTH_COMPLETE && result_object['AUTH_CON' + connector_id  + '_IDTAG'] == old_state.AUTH_IDTAG && old_state.STATUS == 'ReceivedFromOCPP'){
+							//need write answer to modbus
+							console.log('//need write answer to modbus');
+							
+							mongo_db_instance.collection("tag_requests").updateMany(
+								{
+									STATUS: 'ReceivedFromOCPP'
+								}, {
+									$set: {
+										STATUS: 'TransmittedToModbus'
+									} 
+								}, throw_callback
+							);
+						
+							writeRegister('AUTH_CON' + connector_id  + '_COMPLETE', 1);
+							writeRegister('AUTH_CON' + connector_id  + '_IDTAG_ACCEPTED', +old_state.AUTH_IDTAG_ACCEPTED);
+						} else {
+							if(!!old_state && (old_state.STATUS == "ReceivedFromModbus" || old_state.STATUS == "TransmittedToOCPP" || old_state.STATUS == "TransmittedToModbus" ) ){
+								console.log('not need write to DB');
+							} else {
+								//need write request to DB again
+								console.log('need write to DB again');
+								var new_state = {
+									AUTH_IDTAG: result_object['AUTH_CON' + connector_id  + '_IDTAG'],
+									STATUS: 'ReceivedFromModbus',
+									TIME: current_time,
+									CONNECTOR_ID: connector_id
+								}
+							
+								if(old_state != null && !!old_state._id){
+									mongo_db_instance.collection("tag_requests").updateOne({_id: old_state._id}, new_state, throw_callback);
+								} else {
+									mongo_db_instance.collection("tag_requests").insertOne(new_state, throw_callback);
+								}
+							}
+						}
 					});
 				} else {
-					mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
+					
+					mongo_db_instance.collection("tag_requests").updateMany(
+						{
+							STATUS: 'TransmittedToModbus',
+							CONNECTOR_ID: connector_id
+						}, {
+							$set: {
+								STATUS: 'AcceptedToModbus'
+							} 
+						}, throw_callback
+					);
+					
+					writeRegister('AUTH_CON' + connector_id + '_COMPLETE', 0);
+					writeRegister('AUTH_CON' + connector_id + '_IDTAG_ACCEPTED', 0);
+				}
+			};
+			
+			find_auth(1);
+			find_auth(2);
+		
+			//BOOT NOTIFICATION
+			mongo_db_instance.collection("boot_notification_state").findOne({}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				var new_state = {}
+				if (!!result_object.BN_PLC_RUNNING){
+					new_state = {
+						BN_PLC_RUNNING: result_object.BN_PLC_RUNNING,
+				    	BN_PLC_SW_VERSION: result_object.BN_PLC_SW_VERSION,
+				    	BN_EVCHST_MODEL: result_object.BN_EVCHST_MODEL
+					}
+				} else {
+					new_state = {
+						BN_PLC_RUNNING: result_object.BN_PLC_RUNNING,
+				    	BN_PLC_SW_VERSION: '',
+				    	BN_EVCHST_MODEL: '',
+				    	BN_CS_DATETIME: '',
+				    	BN_EVCHST_ACCEPTED: '' 
+					}
+				}
+			
+				var boot_result_write = [getBufferFromUInt64(), getBufferFromUInt16(!!old_state ? old_state.BN_EVCHST_ACCEPTED : 0)];
+						
+				writeRegister('BN_CS_DATETIME', !!old_state ? old_state.BN_CS_DATETIME : 0);
+				writeRegister('BN_EVCHST_ACCEPTED', !!old_state ? old_state.BN_EVCHST_ACCEPTED : 0);
+			
+				if(old_state != null && !!old_state._id){
+					mongo_db_instance.collection("boot_notification_state").updateOne({_id: old_state._id}, { $set: new_state }, throw_callback);
+				} else {
+					mongo_db_instance.collection("boot_notification_state").insertOne(new_state, throw_callback);
+				}
+			
+			});
+		
+			//HEARTBEAT
+			mongo_db_instance.collection("heartbeat_state").findOne({}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+		
+				writeRegister('HB_CS_DATETIME', !!old_state ? old_state.HB_CS_DATETIME : 0);
+			});
+		
+			//METER VALUES
+			mongo_db_instance.collection("meter_values").findOne({}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				var new_state = {
+					MV_CONNECTOR1_WHMETER: result_object.MV_CONNECTOR1_WHMETER,
+			    	MV_CONNECTOR2_WHMETER: result_object.MV_CONNECTOR2_WHMETER,
+			    	MV_CONNECTOR1_ACTPOW: result_object.MV_CONNECTOR1_ACTPOW,
+			    	MV_CONNECTOR2_ACTPOW: result_object.MV_CONNECTOR2_ACTPOW,
+			    	MV_CONNECTOR1_VOLTAGE: result_object.MV_CONNECTOR1_VOLTAGE,
+			    	MV_CONNECTOR2_VOLTAGE: result_object.MV_CONNECTOR2_VOLTAGE,
+			    	MV_CONNECTOR1_CURRENT: result_object.MV_CONNECTOR1_CURRENT,
+			    	MV_CONNECTOR2_CURRENT: result_object.MV_CONNECTOR2_CURRENT,
+				}
+			
+				if(old_state != null && !!old_state._id){
+					mongo_db_instance.collection("meter_values").updateOne({_id: old_state._id}, new_state, throw_callback);
+				} else {
+					mongo_db_instance.collection("meter_values").insertOne(new_state, throw_callback);
+				}
+			});
+		
+			//START TRANSACTION
+		
+			var find_start = function(connector_id){
+				mongo_db_instance.collection("start_transaction").findOne({
+					CONNECTOR_ID: connector_id
+				}, function(err, old_state) {
+					if (throw_callback(err))
+						return;
+					if(result_object['START_CON' + connector_id + '_CMD'] == true){
+						console.log('START_CON' + connector_id + '_CMD == true');
+						
+						if(connector_id == 2){
+							console.log('old_state')
+							console.log(old_state)
+							console.log('START_CON' + connector_id  + '_IDTAG: ' + result_object['START_CON' + connector_id  + '_IDTAG'])
+							if(!!old_state){
+								console.log("result_object['START_CON' + connector_id  + '_IDTAG'] == old_state.START_IDTAG -> " + (result_object['START_CON' + connector_id  + '_IDTAG'] == old_state.START_IDTAG))
+								console.log("old_state.STATUS == 'ReceivedFromOCPP' -> " + (old_state.STATUS == 'ReceivedFromOCPP'))
+								console.log("old_state.TIME+REREAD_TIMEOUT >= current_time -> " + (old_state.TIME+REREAD_TIMEOUT >= current_time))
+							}
+						}
+						
+						
+						if(!!old_state && !!old_state.START_COMPLETE && result_object['START_CON' + connector_id  + '_IDTAG'] == old_state.START_IDTAG && old_state.STATUS == 'ReceivedFromOCPP' && old_state.TIME+REREAD_TIMEOUT >= current_time){
+							//need write answer to modbus
+							console.log('need write answer to modbus');
+							console.log('START_CON' + connector_id  + '_COMPLETE: ' + 1);
+							console.log('START_CON' + connector_id  + '_ACCEPTED: ' + +old_state.START_ACCEPTED);
+							console.log('START_CON' + connector_id  + '_TRANSACTION_ID: ' + old_state.START_TRANSACTION_ID);
+							
+							writeRegister('START_CON' + connector_id  + '_COMPLETE', 1);
+							writeRegister('START_CON' + connector_id  + '_ACCEPTED', +old_state.START_ACCEPTED);
+							writeRegister('START_CON' + connector_id  + '_TRANSACTION_ID', old_state.START_TRANSACTION_ID);
+						} else {
+							if(!!old_state && old_state.STATUS == "ReceivedFromModbus"){
+								console.log('not need write to DB');
+							} else {
+								//need write request to DB again
+								console.log('need write to DB again');
+								var new_state = {
+									START_CONNECTOR_ID: result_object['START_CON' + connector_id  + '_CONNECTOR_ID'],
+									START_WHMETER: result_object['START_CON' + connector_id  + '_WHMETER'],
+									START_IDTAG: result_object['START_CON' + connector_id  + '_IDTAG'],
+									STATUS: 'ReceivedFromModbus',
+									TIME: current_time,
+									CONNECTOR_ID: connector_id
+								}
+								
+								if(connector_id == 2){
+									console.log('new_state');
+									console.log(new_state);
+								}
+							
+								if(old_state != null && !!old_state._id){
+									mongo_db_instance.collection("start_transaction").updateOne({_id: old_state._id}, new_state, throw_callback);
+								} else {
+									mongo_db_instance.collection("start_transaction").insertOne(new_state, throw_callback);
+								}
+							}
+						}
+					} else {
+						if(old_state != null && !!old_state._id){
+							mongo_db_instance.collection("start_transaction").remove( {_id: old_state._id}, throw_callback)
+						}
+					
+						//console.log('START_CON' + connector_id + '_CMD == false');
+						writeRegister('START_CON' + connector_id  + '_COMPLETE', 0);
+						writeRegister('START_CON' + connector_id  + '_ACCEPTED', 0);
+						writeRegister('START_CON' + connector_id  + '_TRANSACTION_ID', 0);
+					}
+				});
+			}
+		
+			find_start(1);
+			find_start(2);
+		
+			//STATUS NOTIFICATION
+			var status_notif = function(connector_id){
+		    	if(result_object['SN_CON' + connector_id + '_CMD'] == true){
+					mongo_db_instance.collection("status_notifications").findOne({
+						CONNECTOR_ID: connector_id,
+						STATUS: 'ReceivedFromModbus',
+						SN_CON_FAULTCODE: getConnectorFaultcode(result_object['SN_CON' + connector_id + '_FAULTCODE']),
+						SN_CON_STATUS: getConnectorStatus(result_object['SN_CON' + connector_id + '_STATUS'])
+					}, function(err, old_state) {
+						if(!!old_state){
+							console.log('status_notifications not need write');
+							writeRegister('SN_CON' + connector_id + '_COMPLETE', 1);
+						} else {
+							mongo_db_instance.collection("status_notifications").insertOne({
+								CONNECTOR_ID: connector_id,
+								SN_CON_FAULTCODE: getConnectorFaultcode(result_object['SN_CON' + connector_id + '_FAULTCODE']),
+								SN_CON_STATUS: getConnectorStatus(result_object['SN_CON' + connector_id + '_STATUS']),
+								STATUS: 'ReceivedFromModbus'
+							}, function(err, insert_result){
+								if (throw_callback(err))
+									return;
+								writeRegister('SN_CON' + connector_id + '_COMPLETE', 1);
+							});
+						}
+					});
+				} else {
+					writeRegister('SN_CON' + connector_id + '_COMPLETE', 0);
 				}
 			}
-		});
+			
+		    status_notif(1);
+			status_notif(2);
 		
+		    //STOP TRANSACTION
+			var find_stop = function(connector_id){
+				if(result_object['STOP_CON' + connector_id + '_CMD'] == true){
+					console.log('STOP_CON' + connector_id + '_CMD == true');
+					mongo_db_instance.collection("stop_transactions").findOne({
+						STOP_TRANSACTION_ID: ''+result_object['STOP_CON' + connector_id + '_TRANSACTION_ID'],
+						STOP_CONNECTOR_ID: connector_id
+					}, function(err, old_state) {
+						if (throw_callback(err))
+							return;
+						
+						console.log(old_state)
+						if(old_state != null && !!old_state._id){
+							//FINDED STOP_TRANSACTION_ID
+							if(old_state.STATUS == 'ReceivedFromOCPP'){
+								writeRegister('STOP_CON' + connector_id  + '_COMPLETE', 1);
+							} else {
+								//wait response
+							}
+						} else {
+							var new_state = {
+								STOP_CONNECTOR_ID: connector_id,
+								STOP_WHMETER: result_object['STOP_CON' + connector_id + '_WHMETER'],
+								STOP_IDTAG: result_object['STOP_CON' + connector_id + '_IDTAG'],
+								STOP_TRANSACTION_ID: ''+result_object['STOP_CON' + connector_id + '_TRANSACTION_ID'],
+								STATUS: 'ReceivedFromModbus',
+								TIME: current_time
+							}
+							mongo_db_instance.collection("stop_transactions").insertOne(new_state, throw_callback);
+						}
+					});
+				} else {
+					//console.log('STOP_CON' + connector_id + '_CMD == false');
+					writeRegister('STOP_CON' + connector_id  + '_COMPLETE', 0);
+				}
+			}
+		
+			find_stop(1);
+			find_stop(2);
+		
+			mongo_db_instance.collection("reserve_state").find(
+				{
+					STATUS: 'ReceivedFromOCPP',
+					$or:[
+						{ CONNECTOR_ID: '1' },
+						{ CONNECTOR_ID: '2' }
+					]
+				}
+			).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				//console.log("reserve_state");
+				//console.log(old_state);
+				if (!!old_state) for(i = 0; i < old_state.length; i++ ){
+					var values = old_state[i];					
+				
+					mongo_db_instance.collection("reserve_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+						if (throw_callback(err))
+							return;
+					
+						writeRegister('RESERV_CON' + values.CONNECTOR_ID  + '_IDTAG', values.RESERV_CON_IDTAG+'');
+						writeRegister('RESERV_CON' + values.CONNECTOR_ID  + '_RESID', values.RESERV_CON_RESID);
+						writeRegister('RESERV_CON' + values.CONNECTOR_ID  + '_DATETIME', +values.RESERV_CON_DATETIME);
+						writeRegister('RESERV_CON' + values.CONNECTOR_ID  + '_CMD', values.RESERV_CON_CMD);			
+					});
+				
+				}
+			});
+		
+			mongo_db_instance.collection("reserve_state").find(
+				{
+					STATUS: 'TransmittedToModbus',
+					RESERV_CON_CMD: 1,
+					$or:[
+						{ CONNECTOR_ID: '1' },
+						{ CONNECTOR_ID: '2' }
+					]
+				}
+			).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
+				if (throw_callback(err))
+					return;
+
+				if (!!old_state) for(i = 0; i < old_state.length; i++ ){
+					var values = old_state[i];	
+					if(+values.RESERV_CON_DATETIME < +current_time ){
+				
+						mongo_db_instance.collection("reserve_state").updateOne({_id: values._id}, { $set: {STATUS: 'ExpiredToModbus', RESERV_CON_CMD: 0} }, function(err, res){
+							if (throw_callback(err))
+								return;
+							
+							writeRegister('RESERV_CON' + values.CONNECTOR_ID  + '_CMD', 0);		
+						});
+					}
+				}
+			});
+				
+			mongo_db_instance.collection("availability_state").find(
+				{
+					STATUS: 'ReceivedFromOCPP',
+					$or:[
+						{ CONNECTOR_ID: '1' },
+						{ CONNECTOR_ID: '2' }
+					]
+				}
+			).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				//console.log("availability_state");
+				//console.log(old_state);
+				if (!!old_state) for(i = 0; i < old_state.length; i++ ){
+					var values = old_state[i];
+					mongo_db_instance.collection("availability_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+						if (throw_callback(err))
+							return;
+						
+						writeRegister('CONTROL_CON' + values.CONNECTOR_ID  + '_LOCK_ALLOW', values.CAN_CHARGE);
+						writeRegister('CONTROL_CON' + values.CONNECTOR_ID  + '_CHARGING_ALLOW', values.CAN_CHARGE);
+						writeRegister('CONTROL_CON' + values.CONNECTOR_ID  + '_AUTH_ALLOW', values.CAN_AUTH);			
+					});
+				
+				}
+			});
+			mongo_db_instance.collection("lock_state").find(
+				{
+					STATUS: 'ReceivedFromOCPP',
+					$or:[
+						{ CONNECTOR_ID: '1' },
+						{ CONNECTOR_ID: '2' }
+					]
+				}
+			).sort({ _id: -1 }).limit(2).toArray( function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				if (!!old_state) for(i = 0; i < old_state.length; i++ ){
+					var values = old_state[i];
+					mongo_db_instance.collection("lock_state").updateOne({_id: values._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+						if (throw_callback(err))
+							return;
+						
+						writeRegister('CONTROL_CON' + values.CONNECTOR_ID  + '_LOCK_ALLOW', values.CAN_LOCK);
+						setTimeout(function(CONNECTOR_ID){
+							writeRegister('CONTROL_CON' + CONNECTOR_ID  + '_LOCK_ALLOW', 1);
+						}, UNLOCK_TIMEOUT, values.CONNECTOR_ID);
+					});
+				
+				}
+			});
+		
+			mongo_db_instance.collection("stop_requests").findOne({
+				STATUS: 'ReceivedFromOCPP'
+			}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				if (!!old_state) {
+					if(!!old_state.TRANSACTION_ID && !!old_state.CONNECTOR_ID){
+						
+						mongo_db_instance.collection("stop_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+							if (throw_callback(err))
+								return;
+							
+							writeRegister('RMT_STOP_CON' + old_state.CONNECTOR_ID  + '_CMD', 1);
+							writeRegister('RMT_STOP_CON' + old_state.CONNECTOR_ID  + '_TRANSACTION_ID', old_state.TRANSACTION_ID);
+						}); 
+					} else {
+						mongo_db_instance.collection("stop_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
+					}
+				}
+			});
+			
+			mongo_db_instance.collection("stop_requests").findOne({
+				STATUS: 'TransmittedToModbus'
+			}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				if (!!old_state) {
+					if(!!old_state.TRANSACTION_ID && old_state.CONNECTOR_ID){
+						if(result_object['RMT_STOP_CON' + old_state.CONNECTOR_ID  + '_COMPLETE'] == 1){
+							mongo_db_instance.collection("stop_requests").updateOne({_id: old_state._id}, { 
+								$set: {STATUS: 'ReceivedFromModbus', 'ACCEPTED': result_object['RMT_STOP_CON' + old_state.CONNECTOR_ID  + '_ACCEPTED']} 
+							}, function(err, res){
+								if (throw_callback(err))
+									return;
+								writeRegister('RMT_STOP_CON' + old_state.CONNECTOR_ID  + '_CMD', 0);
+							}); 
+						}
+					} else {
+						mongo_db_instance.collection("stop_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
+					}
+				}
+			});
+		
+			mongo_db_instance.collection("start_requests").findOne({
+				STATUS: 'ReceivedFromOCPP'
+			}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				
+				if (!!old_state) {
+					if(!!old_state.TAG_ID && !!old_state.CONNECTOR_ID){
+						mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'TransmittedToModbus'} }, function(err, res){
+							if (throw_callback(err))
+								return;
+							
+							writeRegister('RMT_START_CON' + old_state.CONNECTOR_ID  + '_CMD', 1);
+							writeRegister('RMT_START_CON' + old_state.CONNECTOR_ID  + '_IDTAG', old_state.TAG_ID);
+						}); 
+					} else {
+						mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
+					}
+				}
+			});
+			
+			mongo_db_instance.collection("start_requests").findOne({
+				STATUS: 'TransmittedToModbus'
+			}, function(err, old_state) {
+				if (throw_callback(err))
+					return;
+				if (!!old_state) {
+					if(!!old_state.TAG_ID && old_state.CONNECTOR_ID){
+						if(result_object['RMT_START_CON' + old_state.CONNECTOR_ID  + '_COMPLETE'] == 1){
+							mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { 
+								$set: {STATUS: 'ReceivedFromModbus', 'ACCEPTED': result_object['RMT_START_CON' + old_state.CONNECTOR_ID  + '_ACCEPTED']} 
+							}, function(err, res){
+								if (throw_callback(err))
+									return;
+								writeRegister('RMT_START_CON' + old_state.CONNECTOR_ID  + '_CMD', 0);
+							}); 
+						}
+					} else {
+						mongo_db_instance.collection("start_requests").updateOne({_id: old_state._id}, { $set: {STATUS: 'FieldsError'} }, throw_callback);
+					}
+				}
+			});
+	
+	    }, console.error);
 	
     }, console.error);
 	
@@ -643,5 +887,6 @@ if(!debug){
 	client.bind(UDP_LISTENING_PORT);
 } else {
 	//modbus_up('192.168.2.92', 502);
+	//modbus_up('127.0.0.1', 502);
 	modbus_up(debug_addr, 502);
 }

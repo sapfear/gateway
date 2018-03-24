@@ -86,18 +86,21 @@ var cbxs = {
 							}, self.throw_callback
 						);
 					} else {
-						self.mongo_db_instance.collection("tag_requests").updateOne({_id: result._id}, { $set: {STATUS: 'TransmittedToOCPP'} }, function(err, res){
-							if (self.throw_callback(err))
-								return;
+						if(new Date().getTime() - cbxs.auth_request_time > 10*1000){
+							self.mongo_db_instance.collection("tag_requests").updateOne({_id: result._id}, { $set: {STATUS: 'TransmittedToOCPP'} }, function(err, res){
+								if (self.throw_callback(err))
+									return;
+									
+								cbxs.idTagTmp = result.AUTH_IDTAG;
+								cbxs.auth_request_time = new Date().getTime();
 								
-							cbxs.idTagTmp = result.AUTH_IDTAG;
-							
-							cbxs.actionsQueue.push({
-								procedure: 'Authorize',
-								arguments: { idTag: result.AUTH_IDTAG }
+								cbxs.actionsQueue.push({
+									procedure: 'Authorize',
+									arguments: { idTag: result.AUTH_IDTAG }
+								});
+								cbxs.processActionsQueue();
 							});
-							cbxs.processActionsQueue();
-						});
+						}
 					}
 				}
 			});
@@ -146,6 +149,7 @@ var cbxs = {
 						        reservationId: 0
 							}
 						});
+						cbxs.startRequestConnectorId = result.START_CONNECTOR_ID;
 						cbxs.processActionsQueue();
 					});
 				}
@@ -188,7 +192,7 @@ var cbxs = {
 							
 							if (err) boot_notificate_loop(delay);
 							
-							if (result.BN_PLC_RUNNING == 1){
+							if (!!result && result.BN_PLC_RUNNING == 1){
 								console.log('result.BN_PLC_RUNNING == 1');
 								cbxs.actionsQueue.push({
 									procedure: 'BootNotification',
@@ -328,7 +332,8 @@ var cbxs = {
     self.onResult('StartTransaction', function(values) {
 		if(self.mongo_client_online_status != false) self.mongo_db_instance.collection("start_transaction").updateOne(
 			{
-				STATUS: 'TransmittedToOCPP'
+				STATUS: 'TransmittedToOCPP',
+				CONNECTOR_ID: cbxs.startRequestConnectorId
 			}, {
 				$set: {
 					STATUS: 'ReceivedFromOCPP', 
@@ -625,6 +630,8 @@ var cbxs = {
   heartbeatInterval: null,
 
   idTagTmp: null,
+  auth_request_time: 0,
+  startRequestConnectorId: null,
 
   transactionIdClient: 0,
   
